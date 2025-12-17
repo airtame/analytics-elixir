@@ -25,9 +25,9 @@ defmodule Segment.Http do
   * `config :segment, :retry_attempts` The number of times to retry sending against the segment API. Default value is 3
   * `config :segment, :retry_expiry` The maximum time (in ms) spent retrying. Default value is 10000 (10 seconds)
   * `config :segment, :retry_start` The time (in ms) to start the first retry. Default value is 100
-  * `config :segment, :send_to_http` If set to `false`, the libray will override the Tesla Adapter implementation to only log segment calls to `debug` but not make any actual API calls. This can be useful if you want to switch off Segment for test or dev. Default value is true
+  * `config :segment, :send_to_http` If set to `false`, the library will override the Tesla Adapter implementation to only log segment calls to `debug` but not make any actual API calls. This can be useful if you want to switch off Segment for test or dev. Default value is true
 
-  The retry uses a linear back-off strategy when retring the Segment API.
+  The retry uses a linear back-off strategy when retrying the Segment API.
 
   Additionally a different Tesla Adapter can be used if you want to use something other than Hackney.
 
@@ -35,12 +35,10 @@ defmodule Segment.Http do
 
   """
   @type client :: Tesla.Client.t()
-  @type adapter :: Tesla.adapter()
+  @type adapter :: Tesla.Client.adapter()
 
   require Logger
   use Retry
-
-  @segment_api_url "https://api.segment.io/v1/"
 
   @doc """
     Create a Tesla client with the Segment Source Write API Key
@@ -66,7 +64,7 @@ defmodule Segment.Http do
   @spec client(String.t(), adapter()) :: client()
   def client(api_key, adapter) do
     middleware = [
-      {Tesla.Middleware.BaseUrl, @segment_api_url},
+      {Tesla.Middleware.BaseUrl, Segment.Config.api_url()},
       Tesla.Middleware.JSON,
       {Tesla.Middleware.BasicAuth, %{username: api_key, password: ""}}
     ]
@@ -77,15 +75,27 @@ defmodule Segment.Http do
   @doc """
     Send a list of Segment events as a batch
   """
-  @spec send(String.t(), list(Segment.segment_event())) :: :ok | :error
+  @spec send(client(), list(Segment.segment_event())) :: :ok | :error
   def send(client, events) when is_list(events), do: batch(client, events)
 
-  @doc """
-    Send a list of Segment events as a batch
-  """
-  @spec send(String.t(), Segment.segment_event()) :: :ok | :error
+  @spec send(client(), Segment.segment_event()) :: :ok | :error
   def send(client, event) do
-    case make_request(client, event.type, prepare_events(event), Segment.Config.retry_attempts()) do
+    :telemetry.span([:segment, :send], %{event: event}, fn ->
+      tesla_result =
+        make_request(client, event.type, prepare_events(event), Segment.Config.retry_attempts())
+
+      case process_send_post_result(tesla_result) do
+        :ok ->
+          {:ok, %{event: event, status: :ok, result: tesla_result}}
+
+        :error ->
+          {:error, %{event: event, status: :error, error: tesla_result, result: tesla_result}}
+      end
+    end)
+  end
+
+  defp process_send_post_result(tesla_result) do
+    case tesla_result do
       {:ok, %{status: status}} when status == 200 ->
         :ok
 
@@ -114,12 +124,26 @@ defmodule Segment.Http do
   """
   @spec batch(String.t(), list(Segment.segment_event()), map() | nil, map() | nil) :: :ok | :error
   def batch(client, events, context \\ nil, integrations \\ nil) do
-    data =
-      %{batch: prepare_events(events)}
-      |> add_if(:context, context)
-      |> add_if(:integrations, integrations)
+    :telemetry.span([:segment, :batch], %{events: events}, fn ->
+      data =
+        %{batch: prepare_events(events)}
+        |> add_if(:context, context)
+        |> add_if(:integrations, integrations)
 
-    case make_request(client, "batch", data, Segment.Config.retry_attempts()) do
+      tesla_result = make_request(client, "batch", data, Segment.Config.retry_attempts())
+
+      case process_batch_post_result(tesla_result, events) do
+        :ok ->
+          {:ok, %{events: events, status: :ok, result: tesla_result}}
+
+        :error ->
+          {:error, %{events: events, status: :error, error: tesla_result, result: tesla_result}}
+      end
+    end)
+  end
+
+  defp process_batch_post_result(tesla_result, events) do
+    case tesla_result do
       {:ok, %{status: status}} when status == 200 ->
         :ok
 
@@ -132,9 +156,7 @@ defmodule Segment.Http do
 
       {:error, err} ->
         Logger.error(
-          "[Segment] Batch call of #{length(events)} events failed after #{
-            Segment.Config.retry_attempts()
-          } retries. #{inspect(err)}"
+          "[Segment] Batch call of #{length(events)} events failed after #{Segment.Config.retry_attempts()} retries. #{inspect(err)}"
         )
 
         :error
